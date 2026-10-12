@@ -1,0 +1,460 @@
+---
+title: "Forecasting Spanish Cement Consumption with SARIMA Models"
+author: "Maria Sans Bosch & David González"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = "..")
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.path = "figures/", dev = "png", dpi = 110,
+  fig.width = 9, fig.height = 4.5, fig.align = "center"
+)
+```
+
+```{r libraries, include = FALSE}
+for (f in list.files("R", pattern = "\\.R$", full.names = TRUE)) source(f)
+library(knitr)
+fmt <- function(df, digits = 3) kable(df, digits = digits, row.names = FALSE)
+coef_table <- function(m) fmt(data.frame(term = names(coef(m)), estimate = coef(m),
+                                         s.e. = sqrt(diag(m$var.coef)), t = t_ratios(m)))
+```
+
+This notebook models the monthly apparent consumption of cement in Spain
+(1990–2017, thousand tonnes) following the **Box–Jenkins methodology**, and then
+extends the baseline SARIMA model with **calendar effects**, an **intervention
+analysis** of the 2008 financial crisis, **automatic outlier detection**, and a
+**deterministic-seasonality** refinement. Models are compared with a
+**rolling-origin out-of-sample evaluation**.
+
+# 1. Data
+
+```{r data}
+raw <- ts(scan("data/cemento.dat", quiet = TRUE), start = c(1988, 1), frequency = 12)
+cement <- window(raw, start = c(1990, 1))
+c(start = start(cement), end = end(cement), n = length(cement))
+```
+
+```{r series-plot}
+plot(cement, main = "Apparent cement consumption in Spain",
+     ylab = "Thousand tonnes", xlab = "")
+abline(v = 1990:2018, col = "grey80", lty = 3)
+rect(2008, -1e4, 2010, 1e4, col = adjustcolor("red", 0.08), border = NA)
+text(2009, max(cement), "2008 crisis", col = "red3", cex = 0.8)
+```
+
+Three features stand out: strong **annual seasonality** (August and December
+dips), a **growing trend** up to 2007, and a **structural collapse** after 2008
+when the Spanish construction sector crashed — consumption fell by ~80 %.
+
+# 2. Making the series stationary
+
+## Variance stabilisation
+
+```{r variance, fig.height = 3.8}
+par(mfrow = c(1, 2))
+boxplot(cement ~ floor(time(cement)), main = "Original", xlab = "", las = 2, cex.axis = 0.6)
+log_cement <- log(cement)
+boxplot(log_cement ~ floor(time(log_cement)), main = "Log", xlab = "", las = 2, cex.axis = 0.6)
+```
+
+The spread of each yearly box grows with the level, so the variance is not
+constant. After a log transform the box heights are much more homogeneous,
+so we work with $\log(X_t)$.
+
+## Seasonality and trend
+
+```{r monthplot, fig.height = 3.8}
+par(mfrow = c(1, 2))
+monthplot(log_cement, main = "Monthplot: log series", ylab = "")
+monthplot(diff(log_cement, 12), main = "Monthplot: after (1 - B^12)", ylab = "")
+```
+
+The monthly means differ clearly (seasonal pattern), and they align after a
+seasonal difference. To decide on regular differencing we compare variances —
+over-differencing shows up as an *increase* in variance:
+
+```{r differencing}
+candidates <- list(
+  "log X"                    = log_cement,
+  "(1-B^12) log X"           = diff(log_cement, 12),
+  "(1-B)(1-B^12) log X"      = diff(diff(log_cement, 12)),
+  "(1-B)^2 (1-B^12) log X"   = diff(diff(diff(log_cement, 12)))
+)
+fmt(data.frame(transformation = names(candidates),
+               variance = sapply(candidates, var)), 5)
+```
+
+The second regular difference increases the variance, so the stationary series is
+
+$$W_t = (1-B)(1-B^{12}) \log X_t$$
+
+```{r stationary-plot, fig.height = 3}
+W <- diff(diff(log_cement, 12))
+plot(W, main = expression(W[t] == (1-B)(1-B^12) * log(X[t])), ylab = "", xlab = "")
+abline(h = 0, col = 2)
+```
+
+# 3. Identification and estimation (Model A)
+
+```{r acf-pacf, fig.height = 3.8}
+par(mfrow = c(1, 2))
+acf(W,  ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(2, rep(1, 11)), main = "ACF of W")
+pacf(W, ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(rep(1, 11), 2), main = "PACF of W")
+```
+
+* **Regular part** (lags close to the origin): ACF cuts off after lag 1 → MA(1);
+  PACF has two significant lags → AR(2).
+* **Seasonal part** (red lags 12, 24, …): ACF has two significant seasonal
+  lags → seasonal MA(2); PACF decays.
+
+We estimate the proposed candidates plus a few neighbours and compare
+information criteria and coefficient significance:
+
+```{r model-selection}
+# do.call() embeds the data in the model call, so predict() can later
+# find the regressors even when the model was fitted inside a function
+fit_sarima <- function(order, seasonal, y = log_cement, xreg = NULL) {
+  do.call("arima", list(x = y, order = order,
+                      seasonal = list(order = seasonal, period = 12), xreg = xreg))
+}
+grid <- list(
+  list(c(2,1,0), c(0,1,2)), list(c(0,1,1), c(0,1,2)), list(c(2,1,1), c(0,1,2)),
+  list(c(2,1,1), c(1,1,1)), list(c(1,1,1), c(0,1,2)), list(c(0,1,1), c(0,1,1))
+)
+selection <- do.call(rbind, lapply(grid, function(g) {
+  m <- fit_sarima(g[[1]], g[[2]])
+  data.frame(model = sprintf("ARIMA(%s)(%s)12", paste(g[[1]], collapse = ","),
+                             paste(g[[2]], collapse = ",")),
+             AIC = m$aic, BIC = BIC(m),
+             min_abs_t = min(abs(t_ratios(m))),
+             all_significant = all(abs(t_ratios(m)) > 2))
+}))
+fmt(selection[order(selection$AIC), ], 2)
+```
+
+**Model A: ARIMA(2,1,1)(0,1,2)₁₂** has the lowest AIC and BIC with all
+coefficients significant.
+
+```{r model-a}
+model_A <- fit_sarima(c(2, 1, 1), c(0, 1, 2))
+coef_table(model_A)
+c(sigma2 = model_A$sigma2, loglik = model_A$loglik, AIC = model_A$aic)
+check_roots(model_A)
+```
+
+## Validation of Model A
+
+```{r validation-a, fig.height = 6}
+plot_residual_diagnostics(model_A)
+```
+
+```{r tests-a}
+fmt(residual_tests(model_A, log_cement))
+```
+
+Model A fails validation: the residuals have a heavy left tail (large
+negative shocks, e.g. 2009 and 2013), normality is rejected by all three tests,
+and the Ljung–Box tests detect remaining autocorrelation. Note also that the
+MA polynomial has a root on the unit circle — we come back to this in
+Section 6. The model cannot explain the crisis or calendar-driven
+fluctuations, which motivates the extensions below.
+
+# 4. Calendar effects and crisis intervention (Model B)
+
+Monthly construction activity depends on how many **working days** a month
+has, and on whether **Easter** falls in March or April. We build both
+regressors (see `R/calendar_effects.R`), together with step dummies for
+the phases of the crisis:
+
+```{r regressors}
+make_regressors <- function(start, n) {
+  yr <- (start[1] * 12 + start[2] - 1 + 0:(n - 1)) %/% 12
+  cbind(
+    easter       = as.numeric(easter_effect(start, n)),
+    trading_days = as.numeric(trading_days(start, n)),
+    crisis_08_09 = as.integer(yr %in% 2008:2009),
+    crisis_10_11 = as.integer(yr %in% 2010:2011),
+    post_2012    = as.integer(yr >= 2012)
+  )
+}
+X <- make_regressors(start(log_cement), length(log_cement))
+head(X)
+```
+
+Note that because the model is differenced, a step dummy acts as a **level
+shift** for the duration of each phase.
+
+```{r model-b-pre}
+pre_B <- fit_sarima(c(2, 1, 1), c(0, 1, 2), xreg = X)
+coef_table(pre_B)
+```
+
+Both calendar regressors are extremely significant, while the AR/MA
+coefficients of Model A lose significance: part of the structure that the
+ARMA terms were absorbing was actually calendar-driven. We re-identify the
+ARMA structure on the series *without* the regression effects:
+
+```{r model-b-identification, fig.height = 3.8}
+linear_B <- ts(log_cement - X %*% coef(pre_B)[colnames(X)],
+               start = start(log_cement), frequency = 12)
+W_B <- diff(diff(linear_B, 12))
+par(mfrow = c(1, 2))
+acf(W_B,  ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(2, rep(1, 11)), main = "ACF")
+pacf(W_B, ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(rep(1, 11), 2), main = "PACF")
+```
+
+The regular part now looks like an MA(1). The seasonal part keeps the same
+structure.
+
+```{r model-b}
+model_B <- fit_sarima(c(0, 1, 1), c(0, 1, 2), xreg = X)
+coef_table(model_B)
+check_roots(model_B)
+```
+
+Individually the crisis dummies are borderline, so we test them **jointly**
+with a likelihood-ratio test:
+
+```{r lr-test}
+model_B_calendar_only <- fit_sarima(c(0, 1, 1), c(0, 1, 2), xreg = X[, 1:2])
+LR <- 2 * (model_B$loglik - model_B_calendar_only$loglik)
+c(LR = LR, df = 3, p_value = pchisq(LR, df = 3, lower.tail = FALSE))
+```
+
+The crisis phases are jointly significant at 5 %, so they are kept.
+
+**Interpretation** (coefficients are on the log scale):
+
+* Each extra working day in a month increases consumption by about
+  `r round(100 * (exp(coef(model_B)["trading_days"]) - 1), 1)` %; swapping a
+  weekend day for a weekday (+3.5 in the regressor) adds about
+  `r round(100 * (exp(3.5 * coef(model_B)["trading_days"]) - 1), 1)` %.
+* When the whole Easter period falls in March instead of April, March
+  consumption is about `r round(100 * (1 - exp(coef(model_B)["easter"])), 1)` %
+  lower (and April's correspondingly higher).
+
+With the calendar effects, residual autocorrelation disappears (all
+Ljung–Box tests pass), but normality is still rejected.
+
+```{r tests-b}
+fmt(residual_tests(model_B, log_cement))
+```
+
+# 5. Outlier detection (Model C)
+
+We run an iterative search for additive outliers (AO), level shifts (LS) and
+transitory changes (TC) on the residuals of Model B (critical value 2.9):
+
+```{r outliers}
+out <- outdetec(model_B, dif = c(1, 12), crit = 2.9, LS = TRUE)
+outliers <- out$atip[order(out$atip$Obs), ]
+outliers$date <- format(as.Date(sprintf("%d-%02d-01",
+  start(log_cement)[1] + (outliers$Obs - 1) %/% 12, (outliers$Obs - 1) %% 12 + 1)), "%b %Y")
+outliers$effect_pct <- 100 * (exp(outliers$W_coeff) - 1)
+fmt(outliers[, c("date", "type_detected", "W_coeff", "effect_pct", "ABS_L_Ratio")], 2)
+```
+
+Four of the ten detected outliers fall in the **2008–2009 crisis**, including
+a permanent **level shift of about −16 % in December 2008**.
+
+```{r linearised, fig.height = 3.8}
+log_cement_lin <- log_cement
+log_cement_lin[] <- lineal(as.numeric(log_cement), out$atip)
+wLS <- sum(out$atip$W_coeff[out$atip$type_detected == "LS"])
+
+par(mfrow = c(1, 2))
+plot(cement, main = "Observed (black) vs outlier-free (red)", ylab = "", xlab = "")
+lines(exp(log_cement_lin), col = 2)
+plot(exp(log_cement - log_cement_lin), main = "Multiplicative outlier effect",
+     ylab = "", xlab = "")
+abline(h = 1, lty = 3)
+```
+
+```{r model-c-identification, fig.height = 3.8}
+W_C <- diff(diff(ts(log_cement_lin - X %*% coef(model_B)[colnames(X)],
+                    start = start(log_cement), frequency = 12), 12))
+par(mfrow = c(1, 2))
+acf(W_C,  ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(2, rep(1, 11)), main = "ACF")
+pacf(W_C, ylim = c(-1, 1), lag.max = 72, lwd = 2, col = c(rep(1, 11), 2), main = "PACF")
+```
+
+The same ARIMA(0,1,1)(0,1,2)₁₂ structure is identified and has the best AIC
+among the candidates with significant coefficients:
+
+```{r model-c}
+model_C <- fit_sarima(c(0, 1, 1), c(0, 1, 2), y = log_cement_lin, xreg = X)
+coef_table(model_C)
+```
+
+```{r tests-c}
+fmt(residual_tests(model_C, log_cement_lin))
+```
+
+Removing the outliers fixes normality. Only the Ljung–Box test at lag 24 is
+borderline.
+
+# 6. A closer look at the seasonal MA (Model D)
+
+In Models A, B and C the two seasonal MA coefficients add up to almost
+exactly −1:
+
+```{r seasonal-unit-root}
+fmt(data.frame(
+  model = c("A", "B", "C"),
+  sma1 = sapply(list(model_A, model_B, model_C), function(m) coef(m)["sma1"]),
+  sma2 = sapply(list(model_A, model_B, model_C), function(m) coef(m)["sma2"]),
+  sum  = sapply(list(model_A, model_B, model_C), function(m) sum(coef(m)[c("sma1", "sma2")])),
+  min_MA_root_modulus = sapply(list(model_A, model_B, model_C),
+                               function(m) min(root_moduli(m)$MA))
+), 4)
+```
+
+With $\Theta_1 + \Theta_2 = -1$, the seasonal MA polynomial factorises as
+$(1 - B^{12})(1 - \Theta_2 B^{12})$: it contains a **unit root that cancels
+the seasonal difference**. The series was seasonally *over-differenced*, which
+means the seasonal pattern is essentially **deterministic** (a fixed profile of
+monthly means) rather than stochastic.
+
+The natural fix is to drop the seasonal difference and model seasonality
+with 11 monthly dummies, keeping a seasonal MA(1) for the remaining
+seasonal correlation:
+
+```{r model-d}
+make_month_dummies <- function(start, n) {
+  m <- ((start[2] - 1 + 0:(n - 1)) %% 12) + 1
+  d <- outer(m, 2:12, "==") * 1
+  colnames(d) <- month.abb[2:12]
+  d
+}
+XD <- cbind(make_month_dummies(start(log_cement), length(log_cement)), X)
+model_D <- fit_sarima(c(0, 1, 1), c(0, 0, 1), y = log_cement_lin, xreg = XD)
+coef_table(model_D)
+check_roots(model_D)
+```
+
+The MA polynomial is now strictly invertible, and the deterministic
+monthly profile is easy to read: relative to January, consumption is ~25–30 %
+higher in May–July, drops in August (holidays), and December is the
+lowest month.
+
+```{r validation-d, fig.height = 6}
+plot_residual_diagnostics(model_D)
+```
+
+```{r tests-d}
+fmt(residual_tests(model_D, log_cement_lin))
+```
+
+Model D is the only model that passes **every** normality,
+homoscedasticity and independence test.
+
+Note: AIC values of Model D are not comparable with A–C because the
+likelihoods are computed on differently differenced series; we compare
+the models on out-of-sample accuracy instead.
+
+# 7. Out-of-sample evaluation
+
+Instead of a single hold-out year, we use a **rolling-origin evaluation**:
+each model is re-estimated on data up to December of 2013, 2014, 2015 and
+2016, and then forecasts the following 12 months (48 forecasts per model).
+Calendar regressors for the forecast horizon are known in advance; crisis
+phases are set according to their definition.
+
+*Limitation:* outliers are detected once on the full sample. No outlier is
+detected after March 2013, so the effect on the test periods is minimal.
+
+```{r rolling-evaluation}
+specs <- list(
+  A = list(y = log_cement,     order = c(2,1,1), seasonal = c(0,1,2), xreg = NULL, wLS = 0),
+  B = list(y = log_cement,     order = c(0,1,1), seasonal = c(0,1,2), xreg = X,    wLS = 0),
+  C = list(y = log_cement_lin, order = c(0,1,1), seasonal = c(0,1,2), xreg = X,    wLS = wLS),
+  D = list(y = log_cement_lin, order = c(0,1,1), seasonal = c(0,0,1), xreg = XD,   wLS = wLS)
+)
+
+forecast_from_origin <- function(spec, origin_year, h = 12) {
+  y_train <- window(spec$y, end = c(origin_year, 12))
+  n_train <- length(y_train)
+  xr_train <- if (is.null(spec$xreg)) NULL else spec$xreg[1:n_train, , drop = FALSE]
+  xr_future <- if (is.null(spec$xreg)) NULL else spec$xreg[n_train + 1:h, , drop = FALSE]
+  m <- fit_sarima(spec$order, spec$seasonal, y = y_train, xreg = xr_train)
+  arima_forecast(m, h = h, newxreg = xr_future, wLS = spec$wLS)
+}
+
+origins <- 2013:2016
+results <- do.call(rbind, lapply(names(specs), function(name) {
+  fcs <- lapply(origins, function(o) forecast_from_origin(specs[[name]], o))
+  fc_all <- do.call(rbind, fcs)
+  actual <- window(cement, start = c(origins[1] + 1, 1))
+  data.frame(model = name, t(forecast_metrics(fc_all, actual)))
+}))
+fmt(results, 3)
+```
+
+Every extension improves on the previous model in all point-forecast
+metrics, while prediction intervals become **narrower without losing
+coverage**: Model D reduces RMSE by
+`r round(100 * (1 - results$RMSE[results$model == "D"] / results$RMSE[results$model == "A"]))` %
+and interval width by
+`r round(100 * (1 - results$CI_width[results$model == "D"] / results$CI_width[results$model == "A"]))` %
+relative to the baseline.
+
+```{r backtest-2017, fig.height = 6}
+par(mfrow = c(2, 2), mar = c(3, 4, 3, 1))
+for (name in names(specs)) {
+  fc <- forecast_from_origin(specs[[name]], 2016)
+  plot_forecast(cement, fc, from = 2014, main = paste("Model", name, "- forecast of 2017"))
+}
+```
+
+# 8. Forecast for 2018
+
+All models under-predict 2017, a year in which consumption started to
+recover; this upturn was not yet visible in the training data.
+
+```{r forecast-2018}
+best <- results$model[which.min(results$RMSE)]
+best
+
+h <- 12
+X_future  <- make_regressors(c(2018, 1), h)
+XD_future <- cbind(make_month_dummies(c(2018, 1), h), X_future)
+spec <- specs[[best]]
+final_model <- fit_sarima(spec$order, spec$seasonal, y = spec$y, xreg = spec$xreg)
+newx <- if (best == "A") NULL else if (best == "D") XD_future else X_future
+fc_2018 <- arima_forecast(final_model, h = h, newxreg = newx, wLS = spec$wLS)
+fc_2018$month <- month.abb
+fmt(fc_2018[, c("month", "lower", "forecast", "upper")], 0)
+```
+
+```{r forecast-2018-plot}
+plot_forecast(cement, fc_2018, from = 2013,
+              main = paste("Model", best, "- 12-month forecast with 95% prediction interval"))
+```
+
+# 9. Conclusions
+
+* **Calendar effects are the single biggest improvement.** Working days and
+  Easter are highly significant and absorb structure that the plain SARIMA
+  model was fitting with extra ARMA terms.
+* **The 2008 crisis is visible both as an intervention and as outliers**:
+  the crisis phases are jointly significant and the outlier search finds a
+  permanent level shift of about −16 % in December 2008.
+* **Seasonality is deterministic.** The seasonal MA unit root in the
+  SARIMA models indicates seasonal over-differencing; replacing the seasonal
+  difference with monthly dummies (Model D) gives an invertible model.
+* **Each extension improves out-of-sample accuracy.** In the rolling-origin
+  evaluation the final model (D) has the lowest RMSE and MAPE and the
+  narrowest prediction intervals while keeping ~98 % coverage, and it is the
+  only model that passes all residual diagnostics.
+* **Possible extensions:** detecting outliers inside each rolling window,
+  modelling volatility clustering (GARCH-type errors), and comparing with
+  automatic approaches such as `forecast::auto.arima`, ETS or Prophet.
+
+```{r session-info}
+sessionInfo()$R.version$version.string
+```
